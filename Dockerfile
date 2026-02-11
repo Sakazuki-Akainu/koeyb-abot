@@ -1,7 +1,8 @@
-FROM python:3.9-slim-buster
+# 🟢 CHANGED: Switched from 'buster' (dead) to 'bookworm' (supported)
+FROM python:3.9-slim-bookworm
 
 # 1. Install System Dependencies
-#    We ADD 'jq', 'curl', and 'nodejs' because animepahe-dl.sh needs them.
+#    We install 'npm' as well to ensure the node environment is complete for the scraper
 RUN apt-get update && apt-get install -y \
     aria2 \
     ffmpeg \
@@ -9,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     jq \
     curl \
     nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
