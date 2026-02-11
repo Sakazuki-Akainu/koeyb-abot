@@ -59,59 +59,40 @@ async def start_web_server():
     await site.start()
     LOGGER.info("✅ Health Check Server Started on Port 8000")
 
-# --- 3. NETWORK ENGINE ---
-def safe_api_get(url, referer=None):
-    headers = {
+# --- 3. NETWORK ENGINE (Session-Based) ---
+def get_browser_session():
+    """Creates a session that behaves like a real Chrome browser."""
+    session = cffi_requests.Session(impersonate="chrome124")
+    session.headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Referer": referer if referer else "https://animepahe.si/"
+        "Referer": "https://animepahe.si/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
     }
-    
-    LOGGER.info(f"📡 Fetching: {url}")
-    try:
-        response = cffi_requests.get(url, impersonate="chrome124", headers=headers, timeout=30)
-        if response.status_code != 200:
-            LOGGER.error(f"❌ HTTP Error {response.status_code} for {url}")
-            return None, f"HTTP Error {response.status_code}"
-        
-        # Try Parse JSON
-        try:
-            return response.json(), None
-        except:
-            return None, "Cloudflare Blocked (HTML response)"
-    except Exception as e:
-        return None, str(e)
+    return session
 
-def solve_kwik(url, referer_url):
+def solve_kwik(session, url, referer_url):
     LOGGER.info(f"🔓 Solving Kwik: {url}")
-    LOGGER.info(f"🔗 Using Referer: {referer_url}")
-    
     try:
-        response = cffi_requests.get(
-            url, 
-            impersonate="chrome124", 
-            headers={"Referer": referer_url},
-            timeout=20
-        )
+        # Update referer for this specific request
+        headers = session.headers.copy()
+        headers["Referer"] = referer_url
+        
+        response = session.get(url, headers=headers, timeout=20)
         
         if response.status_code != 200:
-            LOGGER.error(f"❌ Kwik HTTP {response.status_code} - Blocked?")
+            LOGGER.error(f"❌ Kwik HTTP {response.status_code}")
             return None
 
         # Strategy 1: Standard 'const source'
         match = re.search(r"const\s+source\s*=\s*'([^']+)'", response.text)
-        if match:
-            LOGGER.info("✅ Found m3u8 via Strategy 1")
-            return match.group(1)
+        if match: return match.group(1)
             
-        # Strategy 2: Fallback Regex (Find ANY m3u8 link)
-        # Looks for https://... .m3u8
+        # Strategy 2: Fallback (any m3u8)
         match = re.search(r"(https?://[\w\-\.]+/[\w\-\.]+\.m3u8[^\"']*)", response.text)
-        if match:
-            LOGGER.info("✅ Found m3u8 via Strategy 2 (Fallback)")
-            return match.group(1)
+        if match: return match.group(1)
 
-        LOGGER.warning("❌ Failed to extract m3u8. Dumping snippet...")
-        LOGGER.warning(response.text[:200]) # Log start of page for debugging
+        LOGGER.warning(f"❌ Failed to extract m3u8. Page Start: {response.text[:100]}")
         return None
 
     except Exception as e:
@@ -132,86 +113,114 @@ async def download_anime_episode(command_args, status_msg):
     
     await status_msg.edit_text(f"🔍 **Searching:** `{query}`")
 
-    # 2. Search
-    search_url = f"https://animepahe.si/api?m=search&q={requests.utils.quote(query)}"
-    data, error = safe_api_get(search_url)
-    if not data or not data.get("data"):
-        await status_msg.edit_text("❌ Anime not found or Blocked.")
-        return None
-        
-    anime = data["data"][0]
-    session_id = anime["session"]
-    title = anime["title"]
-    
-    await status_msg.edit_text(f"✅ **{title}**\n📥 Finding Ep {episode_num}...")
-    
-    # 3. Get Episode List
-    eps_url = f"https://animepahe.si/api?m=release&id={session_id}&sort=episode_asc&page=1"
-    eps_data, error = safe_api_get(eps_url)
-    if not eps_data: return None
+    # 🟢 START SESSION (Critical for Cloudflare)
+    s = get_browser_session()
 
-    target_session = None
-    for ep in eps_data["data"]:
-        if int(ep["episode"]) == episode_num:
-            target_session = ep["session"]
-            break
-    
-    if not target_session:
-        await status_msg.edit_text(f"❌ Episode {episode_num} not found.")
-        return None
-
-    # 4. Get Stream Links
-    play_url = f"https://animepahe.si/play/{session_id}/{target_session}"
-    
     try:
-        # Get the Embed Page (needed to find Kwik link)
-        html_response = cffi_requests.get(play_url, impersonate="chrome124", headers={"Referer": "https://animepahe.si/"})
-        kwik_links = re.findall(r'https://kwik\.cx/e/\w+', html_response.text)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Play Page Error: {e}")
-        return None
+        # 2. Search
+        search_url = f"https://animepahe.si/api?m=search&q={requests.utils.quote(query)}"
+        LOGGER.info(f"📡 Fetching: {search_url}")
+        
+        r = s.get(search_url, timeout=30)
+        if r.status_code != 200:
+            await status_msg.edit_text(f"❌ Search HTTP {r.status_code}")
+            return None
+            
+        data = r.json()
+        if not data.get("data"):
+            await status_msg.edit_text("❌ Anime not found.")
+            return None
+            
+        anime = data["data"][0]
+        session_id = anime["session"]
+        title = anime["title"]
+        
+        await status_msg.edit_text(f"✅ **{title}**\n📥 Finding Ep {episode_num}...")
+        
+        # 3. Get Episode List
+        # Small delay to mimic human behavior
+        await asyncio.sleep(1)
+        
+        eps_url = f"https://animepahe.si/api?m=release&id={session_id}&sort=episode_asc&page=1"
+        LOGGER.info(f"📡 Fetching Eps: {eps_url}")
+        
+        r = s.get(eps_url, timeout=30)
+        eps_data = r.json()
 
-    if not kwik_links:
-        await status_msg.edit_text("❌ No stream links found on page.")
-        return None
+        target_session = None
+        for ep in eps_data["data"]:
+            if int(ep["episode"]) == episode_num:
+                target_session = ep["session"]
+                break
         
-    best_link = kwik_links[-1] # Prefer higher quality
-    
-    # 5. Solve Kwik (Passing CORRECT Referer now)
-    m3u8 = solve_kwik(best_link, referer_url=play_url)
-    
-    if not m3u8:
-        await status_msg.edit_text("❌ **Failed to bypass Kwik.**\nCheck logs for details.")
-        return None
+        if not target_session:
+            await status_msg.edit_text(f"❌ Episode {episode_num} not found on Page 1.")
+            return None
+
+        # 4. Get Stream Links (The step that was failing)
+        play_url = f"https://animepahe.si/play/{session_id}/{target_session}"
+        LOGGER.info(f"📡 Fetching Player: {play_url}")
         
-    # 6. Download
-    filename = f"{title} - Episode {episode_num}.mp4"
-    filepath = os.path.join(DOWNLOAD_DIR, filename)
-    
-    await status_msg.edit_text(f"⬇️ **Downloading...**\nFile: `{filename}`")
-    
-    cmd = [
-        "yt-dlp",
-        "--external-downloader", "aria2c",
-        "--external-downloader-args", "-x 16 -k 1M",
-        "--referer", "https://kwik.cx/",
-        "-o", filepath,
-        m3u8
-    ]
-    
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    
-    stdout, stderr = await process.communicate()
-    
-    if os.path.exists(filepath):
-        return filepath
-    else:
-        LOGGER.error(f"DL Error: {stderr.decode()}")
-        await status_msg.edit_text("❌ Download Failed (Aria2).")
+        # Update Referer to trick AnimePahe that we came from the home page
+        s.headers["Referer"] = "https://animepahe.si/"
+        
+        html_response = s.get(play_url, timeout=30)
+        
+        # 🟢 IMPROVED REGEX: Find links in data-src attributes (standard for AnimePahe)
+        # Looks for: https://kwik.cx/e/xXxX
+        kwik_links = re.findall(r'(https?://kwik\.[a-z]+/e/\w+)', html_response.text)
+        
+        if not kwik_links:
+            # Logging the HTML title to see if we got hit by Cloudflare
+            page_title = re.search(r'<title>(.*?)</title>', html_response.text)
+            title_text = page_title.group(1) if page_title else "No Title"
+            LOGGER.error(f"❌ No links. Page Title: {title_text}")
+            await status_msg.edit_text(f"❌ No stream links found.\nPage: {title_text}")
+            return None
+            
+        # Get the last link (usually the best quality/latest added)
+        best_link = kwik_links[-1]
+        
+        # 5. Solve Kwik (Pass session to keep cookies)
+        m3u8 = solve_kwik(s, best_link, referer_url=play_url)
+        
+        if not m3u8:
+            await status_msg.edit_text("❌ Failed to bypass Kwik.")
+            return None
+            
+        # 6. Download
+        filename = f"{title} - Episode {episode_num}.mp4"
+        filepath = os.path.join(DOWNLOAD_DIR, filename)
+        
+        await status_msg.edit_text(f"⬇️ **Downloading...**\nFile: `{filename}`")
+        
+        cmd = [
+            "yt-dlp",
+            "--external-downloader", "aria2c",
+            "--external-downloader-args", "-x 16 -k 1M",
+            "--referer", "https://kwik.cx/",
+            "-o", filepath,
+            m3u8
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if os.path.exists(filepath):
+            return filepath
+        else:
+            LOGGER.error(f"DL Error: {stderr.decode()}")
+            await status_msg.edit_text("❌ Download Failed (Aria2).")
+            return None
+
+    except Exception as e:
+        LOGGER.error(f"Critical Engine Error: {e}")
+        await status_msg.edit_text(f"❌ Error: {e}")
         return None
 
 # --- 4. HANDLERS ---
@@ -237,7 +246,6 @@ async def dl_handler(client, message):
             
     except Exception as e:
         LOGGER.error(e)
-        await status_msg.edit_text(f"❌ Error: {e}")
     
     finally:
         del ACTIVE_TASKS[chat_id]
