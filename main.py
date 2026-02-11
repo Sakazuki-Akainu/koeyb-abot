@@ -9,12 +9,12 @@ import sys
 import requests
 from aiohttp import web
 from pyrogram import Client, filters, idle
-from curl_cffi import requests as cffi_requests  # 🟢 KEY FIX: Browser Impersonation
+from curl_cffi import requests as cffi_requests
 
-# --- LOGGING SETUP ---
+# --- LOGGING SETUP (Fixed for Real-Time) ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 LOGGER = logging.getLogger("Bot")
@@ -59,149 +59,159 @@ async def start_web_server():
     await site.start()
     LOGGER.info("✅ Health Check Server Started on Port 8000")
 
-# --- 3. CORE DOWNLOAD ENGINE (Python Replaces Bash) ---
-def solve_kwik(url):
+# --- 3. ROBUST NETWORK ENGINE ---
+def safe_api_get(url, referer=None):
     """
-    Bypasses Cloudflare on Kwik.cx and extracts the m3u8 link.
+    Safely fetches JSON from an API. 
+    If Cloudflare blocks it (HTML response), it logs the error instead of crashing.
     """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": referer if referer else "https://animepahe.si/"
+    }
+    
+    LOGGER.info(f"📡 Fetching: {url}")
+    
     try:
-        LOGGER.info(f"Solving Kwik: {url}")
-        # Impersonate Chrome to pass Cloudflare
+        # 🟢 Use newer Chrome impersonation
+        response = cffi_requests.get(url, impersonate="chrome124", headers=headers, timeout=30)
+        
+        # Check HTTP Status
+        if response.status_code != 200:
+            LOGGER.error(f"❌ HTTP Error {response.status_code} for {url}")
+            return None, f"HTTP Error {response.status_code}"
+
+        # Try Parse JSON
+        try:
+            return response.json(), None
+        except Exception:
+            # If JSON fails, it's likely a Cloudflare HTML page
+            snippet = response.text[:200].replace("\n", " ")
+            LOGGER.error(f"❌ JSON Parse Failed. Response start: {snippet}")
+            return None, "Cloudflare Blocked Request (Received HTML instead of JSON)"
+
+    except Exception as e:
+        LOGGER.error(f"❌ Network Error: {e}")
+        return None, str(e)
+
+def solve_kwik(url):
+    LOGGER.info(f"🔓 Solving Kwik: {url}")
+    try:
         response = cffi_requests.get(
-            url,
-            impersonate="chrome110",
+            url, 
+            impersonate="chrome124", 
             headers={"Referer": "https://animepahe.si/"},
             timeout=15
         )
-        
-        # Regex to find the obfuscated script source
-        # Usually hidden in: const source='...'
         match = re.search(r"const\s+source\s*=\s*'([^']+)'", response.text)
         if match:
             return match.group(1)
-        
-        # Fallback: Check for eval(function(p,a,c,k,e,d)...)
-        if "eval(function(" in response.text:
-            LOGGER.warning("Complex obfuscation detected (eval). Python extractor might fail.")
-            # In a real scenario, you'd need a JS engine here. 
-            # For now, let's hope Kwik serves the 'const source' version to 'Chrome'.
-            
         return None
     except Exception as e:
-        LOGGER.error(f"Kwik Solve Error: {e}")
+        LOGGER.error(f"Kwik Error: {e}")
         return None
 
 async def download_anime_episode(command_args, status_msg):
-    """
-    Orchestrates the entire download process:
-    1. Parse args
-    2. Search Anime (via AnimePahe API)
-    3. Get Episode Links
-    4. Solve Kwik
-    5. Download via Aria2
-    """
-    # 1. Parse Args (Simple Regex)
-    anime_name_match = re.search(r'-a\s+["\']([^"\']+)["\']', command_args)
+    # 1. Parse Args
+    name_match = re.search(r'-a\s+["\']([^"\']+)["\']', command_args)
     ep_match = re.search(r'-e\s+(\d+)', command_args)
     
-    if not anime_name_match or not ep_match:
-        await status_msg.edit_text("❌ Error parsing arguments.")
+    if not name_match or not ep_match:
+        await status_msg.edit_text("❌ Usage: `/dl -a \"Jujutsu Kaisen\" -e 1`")
         return None
 
-    query = anime_name_match.group(1)
+    query = name_match.group(1)
     episode_num = int(ep_match.group(1))
     
-    await status_msg.edit_text(f"🔍 **Searching for:** `{query}`")
+    await status_msg.edit_text(f"🔍 **Searching:** `{query}`")
 
     # 2. Search AnimePahe
+    search_url = f"https://animepahe.si/api?m=search&q={requests.utils.quote(query)}"
+    data, error = safe_api_get(search_url)
+    
+    if not data:
+        await status_msg.edit_text(f"❌ **Search Failed:** {error}")
+        return None
+        
+    if not data.get("data"):
+        await status_msg.edit_text("❌ Anime not found.")
+        return None
+        
+    anime = data["data"][0]
+    session_id = anime["session"]
+    title = anime["title"]
+    
+    await status_msg.edit_text(f"✅ Found: **{title}**\n📥 Finding Episode {episode_num}...")
+    
+    # 3. Get Episode List (Page 1)
+    eps_url = f"https://animepahe.si/api?m=release&id={session_id}&sort=episode_asc&page=1"
+    eps_data, error = safe_api_get(eps_url)
+    
+    if not eps_data:
+        await status_msg.edit_text(f"❌ **Episode List Failed:** {error}")
+        return None
+
+    target_session = None
+    for ep in eps_data["data"]:
+        if int(ep["episode"]) == episode_num:
+            target_session = ep["session"]
+            break
+    
+    if not target_session:
+        await status_msg.edit_text(f"❌ Episode {episode_num} not found on Page 1.")
+        return None
+
+    # 4. Get Stream Links
+    play_url = f"https://animepahe.si/play/{session_id}/{target_session}"
+    
+    # Kwik extraction logic
     try:
-        search_url = f"https://animepahe.si/api?m=search&q={requests.utils.quote(query)}"
-        # Use cffi here too just in case
-        r = cffi_requests.get(search_url, impersonate="chrome110").json()
-        
-        if not r.get("data"):
-            await status_msg.edit_text("❌ Anime not found.")
-            return None
-            
-        anime_data = r["data"][0] # Pick first result
-        session_id = anime_data["session"]
-        title = anime_data["title"]
-        
-        await status_msg.edit_text(f"✅ Found: **{title}**\n📥 Fetching Episode {episode_num}...")
-        
-        # 3. Get Episode List
-        # Fetch page 1 (AnimePahe paginates, but usually latest eps are on pg 1 or last pg)
-        # For simplicity, fetching all pages logic is omitted, assuming Ep 1 is on Page 1 or we find it.
-        # Ideally, you'd loop through pages.
-        
-        eps_url = f"https://animepahe.si/api?m=release&id={session_id}&sort=episode_asc&page=1"
-        eps_r = cffi_requests.get(eps_url, impersonate="chrome110").json()
-        
-        target_ep_session = None
-        for ep in eps_r["data"]:
-            if int(ep["episode"]) == episode_num:
-                target_ep_session = ep["session"]
-                break
-        
-        if not target_ep_session:
-            await status_msg.edit_text(f"❌ Episode {episode_num} not found on Page 1.")
-            return None
-
-        # 4. Get Stream Links
-        play_url = f"https://animepahe.si/play/{session_id}/{target_ep_session}"
-        play_html = cffi_requests.get(play_url, impersonate="chrome110").text
-        
-        # Extract Kwik Links (regex for data-src or button links)
-        # This is tricky as they are dynamic. We look for 'kwik.cx/e/'
-        kwik_links = re.findall(r'https://kwik\.cx/e/\w+', play_html)
-        
-        if not kwik_links:
-            await status_msg.edit_text("❌ No stream links found.")
-            return None
-            
-        # Prioritize 720p/1080p (usually last in list)
-        best_link = kwik_links[-1] 
-        
-        # 5. Solve Kwik
-        m3u8_link = solve_kwik(best_link)
-        
-        if not m3u8_link:
-            await status_msg.edit_text("❌ Failed to bypass Kwik Cloudflare.")
-            return None
-            
-        # 6. Download with Aria2 (via yt-dlp)
-        filename = f"{title} - Episode {episode_num}.mp4"
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
-        
-        cmd = [
-            "yt-dlp",
-            "--external-downloader", "aria2c",
-            "--external-downloader-args", "-x 16 -k 1M",
-            "--referer", "https://kwik.cx/",
-            "-o", filepath,
-            m3u8_link
-        ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        await status_msg.edit_text(f"⬇️ **Downloading...**\n`{filename}`")
-        
-        stdout, stderr = await process.communicate()
-        
-        if os.path.exists(filepath):
-            return filepath
-        else:
-            LOGGER.error(f"Download Error: {stderr.decode()}")
-            await status_msg.edit_text("❌ Download failed (Aria2 Error).")
-            return None
-
+        html_response = cffi_requests.get(play_url, impersonate="chrome124", headers={"Referer": "https://animepahe.si/"})
+        kwik_links = re.findall(r'https://kwik\.cx/e/\w+', html_response.text)
     except Exception as e:
-        LOGGER.error(f"Engine Error: {e}")
-        await status_msg.edit_text(f"❌ Error: {e}")
+        await status_msg.edit_text(f"❌ Failed to load player: {e}")
+        return None
+
+    if not kwik_links:
+        await status_msg.edit_text("❌ No stream links found.")
+        return None
+        
+    best_link = kwik_links[-1] # Usually 1080p
+    
+    # 5. Solve Kwik
+    m3u8 = solve_kwik(best_link)
+    if not m3u8:
+        await status_msg.edit_text("❌ Failed to bypass Kwik protection.")
+        return None
+        
+    # 6. Download
+    filename = f"{title} - Episode {episode_num}.mp4"
+    filepath = os.path.join(DOWNLOAD_DIR, filename)
+    
+    cmd = [
+        "yt-dlp",
+        "--external-downloader", "aria2c",
+        "--external-downloader-args", "-x 16 -k 1M",
+        "--referer", "https://kwik.cx/",
+        "-o", filepath,
+        m3u8
+    ]
+    
+    await status_msg.edit_text(f"⬇️ **Downloading...**\nFile: `{filename}`")
+    
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    
+    stdout, stderr = await process.communicate()
+    
+    if os.path.exists(filepath):
+        return filepath
+    else:
+        LOGGER.error(f"Aria2 Error: {stderr.decode()}")
+        await status_msg.edit_text("❌ Download Failed (See Logs).")
         return None
 
 # --- 4. BOT HANDLERS ---
@@ -214,21 +224,20 @@ async def dl_handler(client, message):
     if not cmd_text: return await message.reply("Usage: `/dl -a \"Name\" -e 1`")
     
     ACTIVE_TASKS[chat_id] = True
-    status_msg = await message.reply("⏳ **Starting Python Engine...**")
+    status_msg = await message.reply("⏳ **Initializing...**")
     
     try:
-        # Run the Python downloader
         filepath = await download_anime_episode(cmd_text, status_msg)
         
         if filepath:
             await status_msg.edit_text("🚀 **Uploading...**")
-            start = time.time()
             await client.send_document(chat_id, filepath, caption=f"✅ **Done**\n`{os.path.basename(filepath)}`")
             os.remove(filepath)
             await status_msg.delete()
             
     except Exception as e:
         LOGGER.error(e)
+        await status_msg.edit_text(f"❌ Fatal Error: {e}")
     
     finally:
         del ACTIVE_TASKS[chat_id]
