@@ -3,105 +3,367 @@ import asyncio
 import glob
 import shutil
 import time
+import re
+import requests
 import logging
+from aiohttp import web
 from pyrogram import Client, filters, idle
 
-# --- CONFIGURATION ---
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# --- LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger(__name__)
 
-# Channel IDs (Optional)
-CHANNEL_1 = int(os.environ.get("CHANNEL_1", "0")) if os.environ.get("CHANNEL_1") else None
-CHANNEL_2 = int(os.environ.get("CHANNEL_2", "0")) if os.environ.get("CHANNEL_2") else None
-CHANNEL_3 = int(os.environ.get("CHANNEL_3", "0")) if os.environ.get("CHANNEL_3") else None
+# --- 1. CONFIGURATION (Adapted for Koyeb) ---
+try:
+    API_ID = int(os.environ.get('API_ID'))
+    API_HASH = os.environ.get('API_HASH')
+    BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
+    def load_channel(key):
+        val = os.environ.get(key)
+        if not val: return None
+        try: return int(val)
+        except ValueError: return val
+
+    CHANNEL_1 = load_channel('CHANNEL_1')
+    CHANNEL_2 = load_channel('CHANNEL_2')
+    CHANNEL_3 = load_channel('CHANNEL_3')
+
+except Exception as e:
+    LOGGER.error(f"❌ Configuration Error: {e}")
+    exit(1)
+
+STICKER_ID = "CAACAgUAAxkBAAEQj6hpV0JDpDDOI68yH7lV879XbIWiFwACGAADQ3PJEs4sW1y9vZX3OAQ"
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 ACTIVE_TASKS = {}
+SETTINGS = {"ch1": False, "ch2": False, "ch3": True}
 
-app = Client("anime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=16)
+app = Client(
+    "anime_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    ipv6=False,
+    workers=16
+)
 
+# --- 2. HEALTH CHECK SERVER (REQUIRED FOR KOYEB) ---
+async def health_check(request):
+    return web.Response(text="Bot is Running!", status=200)
+
+async def start_web_server():
+    server = web.Application()
+    server.router.add_get("/", health_check)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    # Koyeb expects the app to listen on port 8000
+    site = web.TCPSite(runner, "0.0.0.0", 8000)
+    await site.start()
+    LOGGER.info("✅ Health Check Server Started on Port 8000")
+
+# --- 3. JIKAN API ---
+def get_anime_details(query):
+    try:
+        url = f"https://api.jikan.moe/v4/anime?q={query}&limit=1"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        if data['data']:
+            anime = data['data'][0]
+            image_url = anime['images']['jpg']['large_image_url']
+            if anime.get('trailer') and anime['trailer'].get('images'):
+                max_img = anime['trailer']['images'].get('maximum_image_url')
+                if max_img: image_url = max_img
+            duration_raw = anime.get('duration', '24 min').replace(" per ep", "")
+            return {
+                "title": anime['title'],
+                "native": anime.get('title_japanese', ''),
+                "duration": duration_raw,
+                "url": anime['url'],
+                "image": image_url
+            }
+    except: pass
+    return None
+
+# --- 4. HELPERS ---
+def format_time_duration(seconds):
+    if seconds < 0: seconds = 0
+    if seconds < 60: return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    sec = int(seconds % 60)
+    return f"{minutes}m {sec}s"
+
+def parse_episodes(ep_string):
+    episodes = []
+    parts = ep_string.split(',')
+    for part in parts:
+        if '-' in part:
+            start, end = map(int, part.split('-'))
+            episodes.extend(range(start, end + 1))
+        else:
+            episodes.append(int(part))
+    return sorted(list(set(episodes)))
+
+async def get_video_resolution(filepath):
+    try:
+        cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=s=x:p=0 '{filepath}'"
+        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await process.communicate()
+        height = stdout.decode().strip()
+        if height.isdigit(): return f"{height}p"
+    except: pass
+    return "Unknown"
+
+async def consume_stream(process):
+    while True:
+        line = await process.stdout.readline()
+        if not line: break
+        # Optional: Print logs to Koyeb console to debug
+        print(line.decode().strip())
+
+# --- 5. COMMANDS ---
+@app.on_message(filters.command(["ch1", "ch2", "ch3"]))
+async def toggle_channel(client, message):
+    cmd = message.command[0]
+    try: state = message.command[1].lower()
+    except: return await message.reply(f"⚠️ Usage: `/{cmd} on` or `/{cmd} off`")
+
+    if cmd in SETTINGS:
+        if state == "on":
+            SETTINGS[cmd] = True
+            await message.reply(f"✅ **{cmd.upper()} Enabled.**")
+        elif state == "off":
+            SETTINGS[cmd] = False
+            await message.reply(f"❌ **{cmd.upper()} Disabled.**")
+        else:
+            await message.reply("⚠️ Use `on` or `off`")
+    else:
+        await message.reply("⚠️ Invalid channel.")
+
+@app.on_message(filters.command("settings"))
+async def check_settings(client, message):
+    id1 = f"`{CHANNEL_1}`" if CHANNEL_1 else "❌ **Missing ID**"
+    id2 = f"`{CHANNEL_2}`" if CHANNEL_2 else "❌ **Missing ID**"
+    id3 = f"`{CHANNEL_3}`" if CHANNEL_3 else "❌ **Missing ID**"
+
+    status_text = (
+        "**⚙️ Channel Status:**\n\n"
+        f"📢 **CH1:** {'✅ ON' if SETTINGS['ch1'] else '❌ OFF'} | ID: {id1}\n"
+        f"📢 **CH2:** {'✅ ON' if SETTINGS['ch2'] else '❌ OFF'} | ID: {id2}\n"
+        f"📢 **CH3:** {'✅ ON' if SETTINGS['ch3'] else '❌ OFF'} | ID: {id3}\n"
+    )
+    await message.reply(status_text)
+
+@app.on_message(filters.command("help"))
+async def help_cmd(client, message):
+    await message.reply("`/dl -a \"Name\" -e 1 -r 1080`\n`/cancel` - Stop Task")
+
+# --- 6. MAIN LOGIC (Fixed for Koyeb) ---
 @app.on_message(filters.command("dl"))
-async def run_scraper(client, message):
+async def dl_cmd(client, message):
     chat_id = message.chat.id
-    if chat_id in ACTIVE_TASKS:
-        return await message.reply("⚠️ **Task already running!** Wait for it to finish.")
+    if chat_id in ACTIVE_TASKS: return await message.reply("⚠️ Busy.")
 
-    # 1. Parse Command
-    #    User sends: /dl -a "Naruto" -e 1
-    #    We strip '/dl ' and pass the rest to the bash script.
-    args = message.text[3:].strip()
-    if not args:
-        return await message.reply("❌ Usage: `/dl -a \"Name\" -e 1`")
+    cmd_text = message.text[4:]
+    if not cmd_text: return await help_cmd(client, message)
 
-    status_msg = await message.reply(f"⏳ **Starting Scraper...**\n`{args}`")
-    ACTIVE_TASKS[chat_id] = True
+    USE_POST = "-post" in cmd_text
+    USE_STICKER = "-sticker" in cmd_text
+    cmd_text = cmd_text.replace("-post", "").replace("-sticker", "").strip()
 
     try:
-        # 2. Run the Bash Script
-        #    We use stdbuf to prevent buffering so we get real-time logs
-        cmd = f"stdbuf -oL ./animepahe-dl.sh {args}"
-        
-        process = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        ep_match = re.search(r'-e\s+([\d,-]+)', cmd_text)
+        if not ep_match: return await message.reply("❌ Missing `-e`")
+        episode_list = parse_episodes(ep_match.group(1))
 
-        # 3. Monitor Output (Real-time logs)
-        lines_buffer = []
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-            
-            decoded_line = line.decode().strip()
-            print(f"SCRAPER: {decoded_line}") # Log to server console
-            
-            # Detect "BATCH_PROGRESS" from your bash script to update Telegram
-            if "BATCH_PROGRESS" in decoded_line:
-                try:
-                    progress = decoded_line.split("=")[1]
-                    await status_msg.edit_text(f"📥 **Downloading...**\nProgress: `{progress}`")
-                except:
-                    pass
-
-        await process.wait()
-
-        # 4. Check for Downloads & Upload
-        mp4_files = glob.glob("**/*.mp4", recursive=True)
-        if not mp4_files:
-            await status_msg.edit_text("❌ **Failed.** No files found.\nCheck if the anime name is correct.")
+        resolutions_list = ["1080", "720", "360"]
+        res = "best"
+        if "-r" in cmd_text:
+            if "all" in cmd_text:
+                resolutions = ["1080", "720", "360"]
+                res = "all"
+            else:
+                res_match = re.search(r'-r\s+(\d+)', cmd_text)
+                res = res_match.group(1) if res_match else "best"
+                resolutions = [res]
+                resolutions_list = [res]
+            cmd_text = re.sub(r'-r\s+(\d+|all)', '', cmd_text)
         else:
-            await status_msg.edit_text(f"🚀 **Uploading {len(mp4_files)} files...**")
-            
-            for file_path in mp4_files:
-                # Upload to user
-                sent = await client.send_document(
-                    chat_id, 
-                    document=file_path, 
-                    caption=f"✅ `{os.path.basename(file_path)}`"
+            resolutions = ["1080", "720", "360"]
+
+        audio_lang = "jpn"
+        if "-o eng" in cmd_text: audio_lang = "eng"
+        cmd_text = cmd_text.replace("-o eng", "").replace("-o jpn", "")
+
+        name_match = re.search(r'-a\s+["\']([^"\']+)["\']', cmd_text)
+        anime_query = name_match.group(1) if name_match else "anime"
+        base_args = re.sub(r'-e\s+[\d,-]+', '', cmd_text).strip()
+
+    except Exception as e: return await message.reply(f"❌ Error: {e}")
+
+    status_msg = await message.reply("⏳ **Starting...**")
+
+    anime_info = get_anime_details(anime_query)
+    if not anime_info:
+        anime_info = {"title": anime_query.title(), "native": "", "duration": "24 min", "url": "", "image": None}
+
+    display_title = anime_info['title']
+    if audio_lang == "eng":
+        display_title = f"{display_title} [English Dub]"
+
+    first_word = anime_info['title'].split()[0] if anime_info['title'] else "Anime"
+    clean_tag = "".join(filter(str.isalnum, first_word))
+    hashtag = f"#{clean_tag}"
+
+    audio_str = "Japanese [English Sub]"
+    if audio_lang == "eng": audio_str = "English [Dub]"
+    qual_str = ", ".join([f"{r}p" for r in resolutions_list])
+
+    caption_template = (
+        f"{display_title} | {anime_info['native']}\n"
+        f"{hashtag}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• Audio: {audio_str}\n"
+        f"• Duration: {anime_info['duration']}\n"
+        f"• Quality: {qual_str}"
+    )
+
+    ACTIVE_TASKS[chat_id] = {"status": "running"}
+
+    for i, ep_num in enumerate(episode_list):
+        if chat_id not in ACTIVE_TASKS: break
+
+        t_start = time.time()
+        t_dl_end = t_start
+        t_up_end = t_start
+
+        if USE_POST:
+            for ch_key, ch_id in [("ch1", CHANNEL_1), ("ch2", CHANNEL_2), ("ch3", CHANNEL_3)]:
+                if ch_id and SETTINGS[ch_key]:
+                    try:
+                        if anime_info['image']: await client.send_photo(ch_id, photo=anime_info['image'], caption=caption_template)
+                        else: await client.send_message(ch_id, caption_template)
+                    except: pass
+
+        for current_res in resolutions:
+            if chat_id not in ACTIVE_TASKS: break
+
+            res_flag = f"-r {current_res}" if current_res != "best" else ""
+            audio_flag = f"-o {audio_lang}" if audio_lang else ""
+
+            if current_res != resolutions[0]:
+                await asyncio.sleep(5)
+
+            t_start = time.time()
+            try: await status_msg.edit_text(f"📥 **Downloading Ep {ep_num}...**")
+            except: pass
+
+            # 🟢 CRITICAL: Execute the bash script
+            current_cmd = f"./animepahe-dl.sh {base_args} -e {ep_num} {res_flag} {audio_flag} 2>&1"
+
+            process = await asyncio.create_subprocess_shell(
+                current_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=os.setsid
+            )
+            ACTIVE_TASKS[chat_id]["proc"] = process
+            await consume_stream(process)
+            await process.wait()
+
+            t_dl_end = time.time()
+
+            mp4s = glob.glob("**/*.mp4", recursive=True)
+
+            if not mp4s:
+                if audio_lang == "eng":
+                    await client.send_message(chat_id, f"⚠️ **No English Dub found for Ep {ep_num}.** Skipping...")
+                else:
+                    await client.send_message(chat_id, f"❌ **Download Failed for Ep {ep_num}.**")
+                continue
+
+            file_to_up = max(mp4s, key=os.path.getctime)
+            detected_quality = await get_video_resolution(file_to_up)
+
+            try: await status_msg.edit_text(f"🚀 **Uploading Ep {ep_num}...**")
+            except: pass
+
+            file_caption = (
+                f"{display_title}\n"
+                f"• Episode {ep_num} [{detected_quality}]"
+            )
+
+            try:
+                sent = await client.send_document(chat_id, file_to_up, caption=file_caption)
+                for ch_key, ch_id in [("ch1", CHANNEL_1), ("ch2", CHANNEL_2), ("ch3", CHANNEL_3)]:
+                    if ch_id and SETTINGS[ch_key]:
+                        try: await client.send_document(ch_id, sent.document.file_id, caption=file_caption)
+                        except: pass
+            except: pass
+
+            t_up_end = time.time()
+
+            try:
+                dl_time = t_dl_end - t_start
+                up_time = t_up_end - t_dl_end
+                total_time = t_up_end - t_start
+
+                report = (
+                    f"✅ **Done: Ep {ep_num}** ({current_res}p)\n"
+                    f"📥 DL: `{format_time_duration(dl_time)}`\n"
+                    f"🚀 UP: `{format_time_duration(up_time)}`\n"
+                    f"⏱ Total: `{format_time_duration(total_time)}`"
                 )
-                
-                # Forward to channels
-                if CHANNEL_1: await sent.copy(CHANNEL_1)
-                
-                # Cleanup immediate file to save space
-                os.remove(file_path)
+                await client.send_message(chat_id, report)
+            except Exception as e:
+                print(f"Report Error: {e}")
 
-            await status_msg.edit_text("✅ **All Done!**")
+            try: os.remove(file_to_up); shutil.rmtree(os.path.dirname(file_to_up))
+            except: pass
 
-    except Exception as e:
-        await message.reply(f"❌ **Error:** {e}")
-    
-    finally:
-        # Cleanup folder
-        if os.path.exists(os.path.join(os.getcwd(), "anime.list")):
-            os.remove("anime.list")
-        if chat_id in ACTIVE_TASKS:
-            del ACTIVE_TASKS[chat_id]
+        if USE_STICKER and STICKER_ID:
+            for ch_key, ch_id in [("ch1", CHANNEL_1), ("ch2", CHANNEL_2), ("ch3", CHANNEL_3)]:
+                if ch_id and SETTINGS[ch_key]:
+                    try: await client.send_sticker(ch_id, sticker=STICKER_ID)
+                    except: pass
+
+    if chat_id in ACTIVE_TASKS:
+        await status_msg.delete()
+        del ACTIVE_TASKS[chat_id]
+
+@app.on_message(filters.command("cancel"))
+async def text_cancel(client, message):
+    cid = message.chat.id
+    if cid in ACTIVE_TASKS:
+        if "proc" in ACTIVE_TASKS[cid]:
+            try: os.killpg(os.getpgid(ACTIVE_TASKS[cid]["proc"].pid), 15)
+            except: pass
+        try: client.stop_transmission()
+        except: pass
+        del ACTIVE_TASKS[cid]
+        for f in glob.glob("**/*.mp4", recursive=True):
+             try: os.remove(f); shutil.rmtree(os.path.dirname(f), ignore_errors=True)
+             except: pass
+        await message.reply("🛑 **Stopped.**")
+    else:
+        await message.reply("⚠️ No task.")
+
+async def main():
+    print("🤖 Bot Starting with Health Check...")
+    # 🟢 CRITICAL: Run Bot and Health Check together
+    await asyncio.gather(
+        start_web_server(),
+        app.start(),
+        idle()
+    )
+    await app.stop()
 
 if __name__ == "__main__":
-    print("🤖 Scraper Bot Started on Koyeb!")
-    app.run()
+    # Fix for some asyncio loops
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    loop.run_until_complete(main())
