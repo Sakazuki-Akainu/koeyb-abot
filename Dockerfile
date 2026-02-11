@@ -1,8 +1,6 @@
-# 🟢 CHANGED: Switched from 'buster' (dead) to 'bookworm' (supported)
 FROM python:3.9-slim-bookworm
 
-# 1. Install System Dependencies
-#    We install 'npm' as well to ensure the node environment is complete for the scraper
+# 1. Install System Dependencies (Nodejs, Aria2, FFmpeg, JQ, Curl)
 RUN apt-get update && apt-get install -y \
     aria2 \
     ffmpeg \
@@ -16,16 +14,17 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY . .
 
-# 2. Install Python Requirements
+# 2. Install Python Dependencies
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# 3. Permissions
-#    Make sure the bash script is executable
+# 3. Permissions for the scraper script
 RUN chmod +x animepahe-dl.sh
 
-# 4. Inject High-Speed Config for yt-dlp (The "l5-master" logic)
-#    This forces the bash script to use Aria2c with 16 connections automatically.
+# 4. Inject High-Speed Config for yt-dlp (Forces Aria2c with 16 connections)
 RUN mkdir -p /root/.config/yt-dlp && \
     echo "--external-downloader aria2c\n--external-downloader-args '-x 16 -k 1M'\n--no-mtime\n--buffer-size 16M" > /root/.config/yt-dlp/config
+
+# 5. Expose the Health Check Port
+EXPOSE 8000
 
 CMD ["python3", "main.py"]
