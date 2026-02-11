@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# FAST VERSION: Uses yt-dlp + Aria2 instead of FFmpeg
+# FAST VERSION: Uses yt-dlp native Kwik support
 
 set -e
 set -u
-set -x  # 🟢 Enable Debug Mode (Prints every command executed)
+set -x
 
 usage() {
     printf "%b\n" "$(grep '^#/' "$0" | cut -c4-)" && exit 1
@@ -12,12 +12,6 @@ usage() {
 set_var() {
     _CURL="$(command -v curl)" || command_not_found "curl"
     _JQ="$(command -v jq)" || command_not_found "jq"
-    if [[ -z ${ANIMEPAHE_DL_NODE:-} ]]; then
-        _NODE="$(command -v node)" || command_not_found "node"
-    else
-        _NODE="$ANIMEPAHE_DL_NODE"
-    fi
-    # We now use yt-dlp instead of ffmpeg for downloading
     _YTDLP="$(command -v yt-dlp)" || command_not_found "yt-dlp"
 
     _HOST="https://animepahe.si"
@@ -30,7 +24,6 @@ set_var() {
 }
 
 set_args() {
-    _PARALLEL_JOBS=1
     while getopts ":hlda:s:e:r:t:o:" opt; do
         case $opt in
             a) _INPUT_ANIME_NAME="$OPTARG" ;;
@@ -38,7 +31,6 @@ set_args() {
             e) _ANIME_EPISODE="$OPTARG" ;;
             l) _LIST_LINK_ONLY=true ;;
             r) _ANIME_RESOLUTION="$OPTARG" ;;
-            t) _PARALLEL_JOBS="$OPTARG" ;;
             o) _ANIME_AUDIO="$OPTARG" ;;
             d) _DEBUG_MODE=true; set -x ;;
             h) usage ;;
@@ -64,14 +56,14 @@ set_cookie() {
 }
 
 download_anime_list() {
-    get "$_ANIME_URL" | grep "/anime/" | sed -E 's/.*anime\//[/;s/" title="/] /;s/\">.*/   /;s/" title/]/' > "$_ANIME_LIST_FILE"
+    get "$_ANIME_URL" | grep "/anime/" | sed -E 's/.*anime\//[/;s/" title="/] /;s/\">.*/    /;s/" title/]/' > "$_ANIME_LIST_FILE"
 }
 
 search_anime_by_name() {
     local d n
     d="$(get "$_HOST/api?m=search&q=${1// /%20}")"
     n="$("$_JQ" -r '.total' <<< "$d")"
-    if [[ "$n" -eq "0" ]]; then echo ""; else "$_JQ" -r '.data[] | "[\(.session)] \(.title)   "' <<< "$d" | tee -a "$_ANIME_LIST_FILE" | remove_slug; fi
+    if [[ "$n" -eq "0" ]]; then echo ""; else "$_JQ" -r '.data[] | "[\(.session)] \(.title)    "' <<< "$d" | tee -a "$_ANIME_LIST_FILE" | remove_slug; fi
 }
 
 get_episode_list() { get "${_API_URL}?m=release&id=${1}&sort=episode_asc&page=${2}"; }
@@ -101,25 +93,17 @@ get_episode_link() {
     if [[ -z "${r:-}" ]]; then grep kwik <<< "$l" | tail -1 | grep kwik | awk -F '"' '{print $1}'; else awk -F '" ' '{print $1}' <<< "$r" | tail -1; fi
 }
 
-get_playlist_link() {
-    local s l
-    s="$("$_CURL" --compressed -sS -H "Referer: $_REFERER_URL" -H "cookie: $_COOKIE" "$1" | grep "<script>eval(" | awk -F 'script>' '{print $2}'| sed -E 's/document/process/g' | sed -E 's/querySelector/exit/g' | sed -E 's/eval\(/console.log\(/g')"
-    l="$("$_NODE" -e "$s" | grep 'source=' | sed -E "s/.m3u8';.*/.m3u8/" | sed -E "s/.*const source='//")"
-    echo "$l"
-}
-
 download_episode() {
-    local num="$1" l pl v
+    local num="$1" l v
     v="$_SCRIPT_PATH/${_ANIME_NAME}/${_ANIME_NAME} - Episode ${num}.mp4"
     l=$(get_episode_link "$num")
     [[ "$l" != *"/"* ]] && print_warn "Link error!" && return
-    pl=$(get_playlist_link "$l")
-    [[ -z "${pl:-}" ]] && print_warn "Playlist error!" && return
 
     print_info "Downloading Episode $1 (High Speed)..."
-
-    # 🟢 CHANGED: Replaced FFMPEG with YT-DLP (Uses Global Aria2 Config)
-    "$_YTDLP" --referer "$_REFERER_URL" "$pl" -o "$v" --no-part
+    
+    # 🟢 CHANGED: Passing the Kwik link DIRECTLY to yt-dlp.
+    # This fixes the "Playlist Error" because yt-dlp handles the decryption natively.
+    "$_YTDLP" --referer "$_REFERER_URL" --add-header "Cookie: $_COOKIE" "$l" -o "$v" --no-part
 }
 
 download_episodes() {
