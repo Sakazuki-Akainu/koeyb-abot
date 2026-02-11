@@ -9,7 +9,7 @@ import sys
 import random
 import string
 import urllib.parse
-import subprocess  # 🟢 REQUIRED for running Node.js
+import subprocess
 from aiohttp import web
 from pyrogram import Client, filters, idle
 from curl_cffi import requests as cffi_requests
@@ -65,7 +65,7 @@ async def start_web_server():
 # --- 3. NETWORK ENGINE ---
 def get_browser_session():
     session = cffi_requests.Session(impersonate="chrome124")
-    # Generate the Magic Cookie (Just like Bash script)
+    # Generate Cookie
     ddg2_value = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
     session.cookies.update({"__ddg2_": ddg2_value})
     session.headers = {
@@ -76,57 +76,50 @@ def get_browser_session():
     LOGGER.info(f"🍪 Generated Cookie: {ddg2_value}")
     return session
 
-# 🟢 THE FIX: Replicating the Bash/Node Logic
+# 🟢 FIXED: Regex handles attributes & finds 'source'
 def solve_kwik_with_node(html_content):
-    """
-    Extracts the obfuscated JS, transforms it, and runs it with Node.js
-    just like the bash script:
-    sed -E 's/document/process/g' | sed -E 's/querySelector/exit/g' | sed -E 's/eval\(/console.log\(/g'
-    """
     try:
-        # 1. Extract the script content: <script>eval(...)
-        match = re.search(r"<script>(eval\(.+?\))</script>", html_content, re.DOTALL)
-        if not match:
-            LOGGER.error("❌ Could not find eval() script in Kwik page.")
-            return None
+        # Strategy 1: Find eval() script (Regex updated to handle <script type="...">)
+        match = re.search(r"<script[^>]*>(eval\(.+?\))</script>", html_content, re.DOTALL)
         
-        js_code = match.group(1)
-        
-        # 2. Apply the exact replacements from the bash script
-        js_code = js_code.replace("document", "process")
-        js_code = js_code.replace("querySelector", "exit")
-        js_code = js_code.replace("eval(", "console.log(")
-        
-        # 3. Run with Node.js
-        process = subprocess.run(
-            ["node", "-e", js_code],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        
-        if process.returncode != 0:
-            LOGGER.error(f"❌ Node Error: {process.stderr}")
-            return None
+        if match:
+            js_code = match.group(1)
+            # Bash script logic replacements
+            js_code = js_code.replace("document", "process")
+            js_code = js_code.replace("querySelector", "exit")
+            js_code = js_code.replace("eval(", "console.log(")
             
-        unpacked_js = process.stdout
+            process = subprocess.run(
+                ["node", "-e", js_code],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if process.returncode == 0:
+                # Extract 'source' from node output
+                source_match = re.search(r"source=['\"]([^'\"]+)['\"]", process.stdout)
+                if source_match: 
+                    LOGGER.info("✅ Decoded via Node.js")
+                    return source_match.group(1)
         
-        # 4. Extract the link from the unpacked output
-        # Bash: grep 'source=' | sed ...
-        source_match = re.search(r"source=['\"]([^'\"]+)['\"]", unpacked_js)
+        # Strategy 2: Look for 'const source' directly (Your "Use Source" request)
+        source_match = re.search(r"const\s+source\s*=\s*['\"]([^'\"]+)['\"]", html_content)
         if source_match:
+            LOGGER.info("✅ Found direct source (No Eval needed)")
             return source_match.group(1)
-            
-        # Fallback: Just look for any m3u8
-        m3u8_match = re.search(r"(https?://.*?\.m3u8)", unpacked_js)
+
+        # Strategy 3: Fallback - Any m3u8 link
+        m3u8_match = re.search(r"(https?://[\w\-\.]+/[\w\-\.]+\.m3u8[^\"']*)", html_content)
         if m3u8_match:
+            LOGGER.info("✅ Found m3u8 via Fallback Regex")
             return m3u8_match.group(1)
-            
-        LOGGER.error("❌ Link not found in Node output.")
+
+        LOGGER.error("❌ Link extraction failed.")
         return None
 
     except Exception as e:
-        LOGGER.error(f"❌ Node Execution Failed: {e}")
+        LOGGER.error(f"❌ Node/Regex Error: {e}")
         return None
 
 async def download_anime_episode(command_args, status_msg):
@@ -146,7 +139,7 @@ async def download_anime_episode(command_args, status_msg):
     
     try:
         # Search
-        s.get("https://animepahe.si/", timeout=10) # Warmup
+        s.get("https://animepahe.si/", timeout=10)
         search_query = urllib.parse.quote(query)
         r = s.get(f"https://animepahe.si/api?m=search&q={search_query}", timeout=30)
         
@@ -180,7 +173,7 @@ async def download_anime_episode(command_args, status_msg):
             await status_msg.edit_text(f"❌ Ep {episode_num} not found on Pg 1.")
             return None
 
-        # Get Player HTML
+        # Play Page
         play_url = f"https://animepahe.si/play/{session_id}/{target_session}"
         s.headers["Referer"] = "https://animepahe.si/"
         html_response = s.get(play_url, timeout=30)
@@ -194,11 +187,11 @@ async def download_anime_episode(command_args, status_msg):
         best_link = kwik_links[-1]
         LOGGER.info(f"🔗 Found Kwik Link: {best_link}")
         
-        # Get Kwik HTML
+        # Kwik Page
         s.headers["Referer"] = play_url
         kwik_html = s.get(best_link, timeout=30).text
         
-        # 🟢 CALL THE NODE DECRYPTOR
+        # 🟢 DECRYPT
         m3u8 = solve_kwik_with_node(kwik_html)
         
         if not m3u8:
