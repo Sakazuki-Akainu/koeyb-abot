@@ -6,7 +6,9 @@ import time
 import re
 import logging
 import sys
-import requests
+import random
+import string
+import urllib.parse
 from aiohttp import web
 from pyrogram import Client, filters, idle
 from curl_cffi import requests as cffi_requests
@@ -59,24 +61,39 @@ async def start_web_server():
     await site.start()
     LOGGER.info("✅ Health Check Server Started on Port 8000")
 
-# --- 3. NETWORK ENGINE (Session-Based) ---
+# --- 3. NETWORK ENGINE (With Cookie Injection) ---
 def get_browser_session():
-    """Creates a session that behaves like a real Chrome browser."""
+    """
+    Creates a session with:
+    1. Chrome Impersonation (Cloudflare Bypass)
+    2. __ddg2_ Cookie (AnimePahe Bypass)
+    """
     session = cffi_requests.Session(impersonate="chrome124")
+    
+    # 🟢 GENERATE THE MAGIC COOKIE (Same logic as your Bash script)
+    ddg2_value = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    
+    session.cookies.update({
+        "__ddg2_": ddg2_value
+    })
+    
     session.headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer": "https://animepahe.si/",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
+        "Origin": "https://animepahe.si",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest" # Crucial for API calls
     }
+    
+    LOGGER.info(f"🍪 Injected Cookie __ddg2_: {ddg2_value}")
     return session
 
 def solve_kwik(session, url, referer_url):
     LOGGER.info(f"🔓 Solving Kwik: {url}")
     try:
-        # Update referer for this specific request
         headers = session.headers.copy()
         headers["Referer"] = referer_url
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         
         response = session.get(url, headers=headers, timeout=20)
         
@@ -92,7 +109,7 @@ def solve_kwik(session, url, referer_url):
         match = re.search(r"(https?://[\w\-\.]+/[\w\-\.]+\.m3u8[^\"']*)", response.text)
         if match: return match.group(1)
 
-        LOGGER.warning(f"❌ Failed to extract m3u8. Page Start: {response.text[:100]}")
+        LOGGER.warning(f"❌ Failed to extract m3u8.")
         return None
 
     except Exception as e:
@@ -100,7 +117,6 @@ def solve_kwik(session, url, referer_url):
         return None
 
 async def download_anime_episode(command_args, status_msg):
-    # 1. Parse Args
     name_match = re.search(r'-a\s+["\']([^"\']+)["\']', command_args)
     ep_match = re.search(r'-e\s+(\d+)', command_args)
     
@@ -113,15 +129,27 @@ async def download_anime_episode(command_args, status_msg):
     
     await status_msg.edit_text(f"🔍 **Searching:** `{query}`")
 
-    # 🟢 START SESSION (Critical for Cloudflare)
+    # 🟢 START SESSION & WARM UP
     s = get_browser_session()
-
+    
     try:
+        # Visit Home Page first (Sets Cloudflare cookies)
+        LOGGER.info("🏠 Visiting Homepage...")
+        s.get("https://animepahe.si/", timeout=20)
+        await asyncio.sleep(2) # Let cookies settle
+
         # 2. Search
-        search_url = f"https://animepahe.si/api?m=search&q={requests.utils.quote(query)}"
+        search_query = urllib.parse.quote(query)
+        search_url = f"https://animepahe.si/api?m=search&q={search_query}"
         LOGGER.info(f"📡 Fetching: {search_url}")
         
         r = s.get(search_url, timeout=30)
+        
+        # Debugging 403
+        if r.status_code == 403:
+            await status_msg.edit_text("❌ **Access Denied (403).**\nTrying to rotate cookies...")
+            return None
+            
         if r.status_code != 200:
             await status_msg.edit_text(f"❌ Search HTTP {r.status_code}")
             return None
@@ -136,11 +164,9 @@ async def download_anime_episode(command_args, status_msg):
         title = anime["title"]
         
         await status_msg.edit_text(f"✅ **{title}**\n📥 Finding Ep {episode_num}...")
-        
-        # 3. Get Episode List
-        # Small delay to mimic human behavior
         await asyncio.sleep(1)
         
+        # 3. Get Episode List
         eps_url = f"https://animepahe.si/api?m=release&id={session_id}&sort=episode_asc&page=1"
         LOGGER.info(f"📡 Fetching Eps: {eps_url}")
         
@@ -157,31 +183,30 @@ async def download_anime_episode(command_args, status_msg):
             await status_msg.edit_text(f"❌ Episode {episode_num} not found on Page 1.")
             return None
 
-        # 4. Get Stream Links (The step that was failing)
+        # 4. Get Stream Links
         play_url = f"https://animepahe.si/play/{session_id}/{target_session}"
         LOGGER.info(f"📡 Fetching Player: {play_url}")
         
-        # Update Referer to trick AnimePahe that we came from the home page
+        # Important: Reset headers for HTML navigation (not API)
+        s.headers.pop("X-Requested-With", None)
+        s.headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         s.headers["Referer"] = "https://animepahe.si/"
         
         html_response = s.get(play_url, timeout=30)
         
-        # 🟢 IMPROVED REGEX: Find links in data-src attributes (standard for AnimePahe)
-        # Looks for: https://kwik.cx/e/xXxX
+        # Extract Kwik Links
         kwik_links = re.findall(r'(https?://kwik\.[a-z]+/e/\w+)', html_response.text)
         
         if not kwik_links:
-            # Logging the HTML title to see if we got hit by Cloudflare
-            page_title = re.search(r'<title>(.*?)</title>', html_response.text)
-            title_text = page_title.group(1) if page_title else "No Title"
-            LOGGER.error(f"❌ No links. Page Title: {title_text}")
-            await status_msg.edit_text(f"❌ No stream links found.\nPage: {title_text}")
+            page_title_match = re.search(r'<title>(.*?)</title>', html_response.text)
+            page_title = page_title_match.group(1) if page_title_match else "Unknown"
+            LOGGER.error(f"❌ No links. Title: {page_title}")
+            await status_msg.edit_text(f"❌ No stream links found.\nPage: {page_title}")
             return None
             
-        # Get the last link (usually the best quality/latest added)
         best_link = kwik_links[-1]
         
-        # 5. Solve Kwik (Pass session to keep cookies)
+        # 5. Solve Kwik
         m3u8 = solve_kwik(s, best_link, referer_url=play_url)
         
         if not m3u8:
@@ -246,6 +271,7 @@ async def dl_handler(client, message):
             
     except Exception as e:
         LOGGER.error(e)
+        await status_msg.edit_text(f"❌ Error: {e}")
     
     finally:
         del ACTIVE_TASKS[chat_id]
