@@ -1,9 +1,9 @@
-%%writefile animepahe-dl.sh
 #!/usr/bin/env bash
 # FAST VERSION: Uses yt-dlp + Aria2 instead of FFmpeg
 
 set -e
 set -u
+set -x  # 🟢 Enable Debug Mode (Prints every command executed)
 
 usage() {
     printf "%b\n" "$(grep '^#/' "$0" | cut -c4-)" && exit 1
