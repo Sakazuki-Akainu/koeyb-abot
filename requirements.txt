@@ -2,7 +2,4 @@ pyrogram
 tgcrypto
 yt-dlp
 requests
-aiofiles
-dnspython
-motor
 aiohttp
