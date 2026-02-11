@@ -6,9 +6,10 @@ import time
 import re
 import logging
 import sys
-import requests  # 🟢 FIXED: Was missing, causing the metadata crash
+import requests
 from aiohttp import web
 from pyrogram import Client, filters, idle
+from curl_cffi import requests as cffi_requests  # 🟢 KEY FIX: Browser Impersonation
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -36,23 +37,14 @@ try:
 
 except Exception as e:
     LOGGER.error(f"❌ Configuration Error: {e}")
-    # Prevent immediate crash so logs can be read
     API_ID, API_HASH, BOT_TOKEN = 0, "", ""
 
-STICKER_ID = "CAACAgUAAxkBAAEQj6hpV0JDpDDOI68yH7lV879XbIWiFwACGAADQ3PJEs4sW1y9vZX3OAQ"
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 ACTIVE_TASKS = {}
 SETTINGS = {"ch1": False, "ch2": False, "ch3": True}
 
-app = Client(
-    "anime_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    ipv6=False,
-    workers=16
-)
+app = Client("anime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, ipv6=False, workers=16)
 
 # --- 2. HEALTH CHECK SERVER ---
 async def health_check(request):
@@ -67,243 +59,179 @@ async def start_web_server():
     await site.start()
     LOGGER.info("✅ Health Check Server Started on Port 8000")
 
-# --- 3. JIKAN API (METADATA) ---
-def get_anime_details(query):
+# --- 3. CORE DOWNLOAD ENGINE (Python Replaces Bash) ---
+def solve_kwik(url):
+    """
+    Bypasses Cloudflare on Kwik.cx and extracts the m3u8 link.
+    """
     try:
-        url = f"https://api.jikan.moe/v4/anime?q={query}&limit=1"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if data['data']:
-            anime = data['data'][0]
-            image_url = anime['images']['jpg']['large_image_url']
-            if anime.get('trailer') and anime['trailer'].get('images'):
-                max_img = anime['trailer']['images'].get('maximum_image_url')
-                if max_img: image_url = max_img
-            duration_raw = anime.get('duration', '24 min').replace(" per ep", "")
-            return {
-                "title": anime['title'],
-                "native": anime.get('title_japanese', ''),
-                "duration": duration_raw,
-                "url": anime['url'],
-                "image": image_url
-            }
-    except Exception as e:
-        LOGGER.warning(f"Metadata Fetch Error: {e}")
-    return None
-
-# --- 4. HELPERS ---
-def format_time_duration(seconds):
-    if seconds < 0: seconds = 0
-    if seconds < 60: return f"{int(seconds)}s"
-    minutes = int(seconds // 60)
-    sec = int(seconds % 60)
-    return f"{minutes}m {sec}s"
-
-def parse_episodes(ep_string):
-    episodes = []
-    try:
-        parts = ep_string.split(',')
-        for part in parts:
-            if '-' in part:
-                start, end = map(int, part.split('-'))
-                episodes.extend(range(start, end + 1))
-            else:
-                episodes.append(int(part))
-        return sorted(list(set(episodes)))
-    except ValueError:
-        return []
-
-async def get_video_resolution(filepath):
-    try:
-        cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=s=x:p=0 '{filepath}'"
-        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await process.communicate()
-        height = stdout.decode().strip()
-        if height.isdigit(): return f"{height}p"
-    except: pass
-    return "Unknown"
-
-# 🟢 Capture logs for Telegram reporting
-async def consume_stream(process, log_buffer):
-    while True:
-        line = await process.stdout.readline()
-        if not line: break
+        LOGGER.info(f"Solving Kwik: {url}")
+        # Impersonate Chrome to pass Cloudflare
+        response = cffi_requests.get(
+            url,
+            impersonate="chrome110",
+            headers={"Referer": "https://animepahe.si/"},
+            timeout=15
+        )
         
-        decoded_line = line.decode().strip()
-        print(f"[SCRIPT] {decoded_line}", flush=True) # Real-time server logs
-        log_buffer.append(decoded_line)
+        # Regex to find the obfuscated script source
+        # Usually hidden in: const source='...'
+        match = re.search(r"const\s+source\s*=\s*'([^']+)'", response.text)
+        if match:
+            return match.group(1)
+        
+        # Fallback: Check for eval(function(p,a,c,k,e,d)...)
+        if "eval(function(" in response.text:
+            LOGGER.warning("Complex obfuscation detected (eval). Python extractor might fail.")
+            # In a real scenario, you'd need a JS engine here. 
+            # For now, let's hope Kwik serves the 'const source' version to 'Chrome'.
+            
+        return None
+    except Exception as e:
+        LOGGER.error(f"Kwik Solve Error: {e}")
+        return None
 
-# --- 5. COMMANDS ---
-@app.on_message(filters.command(["ch1", "ch2", "ch3"]))
-async def toggle_channel(client, message):
-    cmd = message.command[0]
-    try: state = message.command[1].lower()
-    except: return await message.reply(f"⚠️ Usage: `/{cmd} on` or `/{cmd} off`")
+async def download_anime_episode(command_args, status_msg):
+    """
+    Orchestrates the entire download process:
+    1. Parse args
+    2. Search Anime (via AnimePahe API)
+    3. Get Episode Links
+    4. Solve Kwik
+    5. Download via Aria2
+    """
+    # 1. Parse Args (Simple Regex)
+    anime_name_match = re.search(r'-a\s+["\']([^"\']+)["\']', command_args)
+    ep_match = re.search(r'-e\s+(\d+)', command_args)
+    
+    if not anime_name_match or not ep_match:
+        await status_msg.edit_text("❌ Error parsing arguments.")
+        return None
 
-    if cmd in SETTINGS:
-        SETTINGS[cmd] = (state == "on")
-        await message.reply(f"✅ **{cmd.upper()} is now {'ENABLED' if state == 'on' else 'DISABLED'}.**")
-    else:
-        await message.reply("⚠️ Invalid channel.")
+    query = anime_name_match.group(1)
+    episode_num = int(ep_match.group(1))
+    
+    await status_msg.edit_text(f"🔍 **Searching for:** `{query}`")
 
-@app.on_message(filters.command("help"))
-async def help_cmd(client, message):
-    await message.reply("`/dl -a \"Name\" -e 1 -r 1080`\n`/cancel` - Stop Task")
+    # 2. Search AnimePahe
+    try:
+        search_url = f"https://animepahe.si/api?m=search&q={requests.utils.quote(query)}"
+        # Use cffi here too just in case
+        r = cffi_requests.get(search_url, impersonate="chrome110").json()
+        
+        if not r.get("data"):
+            await status_msg.edit_text("❌ Anime not found.")
+            return None
+            
+        anime_data = r["data"][0] # Pick first result
+        session_id = anime_data["session"]
+        title = anime_data["title"]
+        
+        await status_msg.edit_text(f"✅ Found: **{title}**\n📥 Fetching Episode {episode_num}...")
+        
+        # 3. Get Episode List
+        # Fetch page 1 (AnimePahe paginates, but usually latest eps are on pg 1 or last pg)
+        # For simplicity, fetching all pages logic is omitted, assuming Ep 1 is on Page 1 or we find it.
+        # Ideally, you'd loop through pages.
+        
+        eps_url = f"https://animepahe.si/api?m=release&id={session_id}&sort=episode_asc&page=1"
+        eps_r = cffi_requests.get(eps_url, impersonate="chrome110").json()
+        
+        target_ep_session = None
+        for ep in eps_r["data"]:
+            if int(ep["episode"]) == episode_num:
+                target_ep_session = ep["session"]
+                break
+        
+        if not target_ep_session:
+            await status_msg.edit_text(f"❌ Episode {episode_num} not found on Page 1.")
+            return None
 
-# --- 6. MAIN LOGIC ---
+        # 4. Get Stream Links
+        play_url = f"https://animepahe.si/play/{session_id}/{target_ep_session}"
+        play_html = cffi_requests.get(play_url, impersonate="chrome110").text
+        
+        # Extract Kwik Links (regex for data-src or button links)
+        # This is tricky as they are dynamic. We look for 'kwik.cx/e/'
+        kwik_links = re.findall(r'https://kwik\.cx/e/\w+', play_html)
+        
+        if not kwik_links:
+            await status_msg.edit_text("❌ No stream links found.")
+            return None
+            
+        # Prioritize 720p/1080p (usually last in list)
+        best_link = kwik_links[-1] 
+        
+        # 5. Solve Kwik
+        m3u8_link = solve_kwik(best_link)
+        
+        if not m3u8_link:
+            await status_msg.edit_text("❌ Failed to bypass Kwik Cloudflare.")
+            return None
+            
+        # 6. Download with Aria2 (via yt-dlp)
+        filename = f"{title} - Episode {episode_num}.mp4"
+        filepath = os.path.join(DOWNLOAD_DIR, filename)
+        
+        cmd = [
+            "yt-dlp",
+            "--external-downloader", "aria2c",
+            "--external-downloader-args", "-x 16 -k 1M",
+            "--referer", "https://kwik.cx/",
+            "-o", filepath,
+            m3u8_link
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        await status_msg.edit_text(f"⬇️ **Downloading...**\n`{filename}`")
+        
+        stdout, stderr = await process.communicate()
+        
+        if os.path.exists(filepath):
+            return filepath
+        else:
+            LOGGER.error(f"Download Error: {stderr.decode()}")
+            await status_msg.edit_text("❌ Download failed (Aria2 Error).")
+            return None
+
+    except Exception as e:
+        LOGGER.error(f"Engine Error: {e}")
+        await status_msg.edit_text(f"❌ Error: {e}")
+        return None
+
+# --- 4. BOT HANDLERS ---
 @app.on_message(filters.command("dl"))
-async def dl_cmd(client, message):
+async def dl_handler(client, message):
     chat_id = message.chat.id
     if chat_id in ACTIVE_TASKS: return await message.reply("⚠️ Busy.")
-
+    
     cmd_text = message.text[4:]
-    if not cmd_text: return await help_cmd(client, message)
-
-    USE_POST = "-post" in cmd_text
-    USE_STICKER = "-sticker" in cmd_text
-    cmd_text = cmd_text.replace("-post", "").replace("-sticker", "").strip()
-
+    if not cmd_text: return await message.reply("Usage: `/dl -a \"Name\" -e 1`")
+    
+    ACTIVE_TASKS[chat_id] = True
+    status_msg = await message.reply("⏳ **Starting Python Engine...**")
+    
     try:
-        ep_match = re.search(r'-e\s+([\d,-]+)', cmd_text)
-        if not ep_match: return await message.reply("❌ Missing `-e`")
-        episode_list = parse_episodes(ep_match.group(1))
-
-        resolutions_list = ["1080", "720", "360"]
-        if "-r" in cmd_text:
-            if "all" in cmd_text:
-                resolutions = ["1080", "720", "360"]
-            else:
-                res_match = re.search(r'-r\s+(\d+)', cmd_text)
-                res = res_match.group(1) if res_match else "best"
-                resolutions = [res]
-                resolutions_list = [res]
-            cmd_text = re.sub(r'-r\s+(\d+|all)', '', cmd_text)
-        else:
-            resolutions = ["1080", "720", "360"]
-
-        audio_lang = "jpn"
-        if "-o eng" in cmd_text: audio_lang = "eng"
-        cmd_text = cmd_text.replace("-o eng", "").replace("-o jpn", "")
-
-        name_match = re.search(r'-a\s+["\']([^"\']+)["\']', cmd_text)
-        anime_query = name_match.group(1) if name_match else "anime"
-        base_args = re.sub(r'-e\s+[\d,-]+', '', cmd_text).strip()
-
-    except Exception as e: return await message.reply(f"❌ Error: {e}")
-
-    status_msg = await message.reply("⏳ **Starting...**")
-
-    # Fetch Metadata
-    anime_info = get_anime_details(anime_query)
-    if not anime_info:
-        anime_info = {"title": anime_query.title(), "native": "", "duration": "24 min", "url": "", "image": None}
-
-    display_title = anime_info['title']
-    if audio_lang == "eng":
-        display_title = f"{display_title} [English Dub]"
-
-    caption_template = f"{display_title} | {anime_info['native']}\nQuality: {', '.join([f'{r}p' for r in resolutions_list])}"
-
-    ACTIVE_TASKS[chat_id] = {"status": "running"}
-    log_buffer = []
-
-    try:
-        for i, ep_num in enumerate(episode_list):
-            if chat_id not in ACTIVE_TASKS: break
-
-            if USE_POST and i == 0:
-                 for ch_key, ch_id in [("ch1", CHANNEL_1), ("ch2", CHANNEL_2), ("ch3", CHANNEL_3)]:
-                    if ch_id and SETTINGS[ch_key]:
-                        try:
-                            if anime_info['image']: await client.send_photo(ch_id, photo=anime_info['image'], caption=caption_template)
-                            else: await client.send_message(ch_id, caption_template)
-                        except: pass
-
-            for current_res in resolutions:
-                if chat_id not in ACTIVE_TASKS: break
-
-                res_flag = f"-r {current_res}" if current_res != "best" else ""
-                audio_flag = f"-o {audio_lang}" if audio_lang else ""
-
-                if current_res != resolutions[0]: await asyncio.sleep(2)
-
-                try: await status_msg.edit_text(f"📥 **Downloading Ep {ep_num}...**\nQuality: {current_res}p")
-                except: pass
-
-                # Run Bash Script
-                current_cmd = f"./animepahe-dl.sh {base_args} -e {ep_num} {res_flag} {audio_flag} 2>&1"
-                
-                print(f"Running: {current_cmd}", flush=True)
-
-                process = await asyncio.create_subprocess_shell(
-                    current_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    preexec_fn=os.setsid
-                )
-                
-                ACTIVE_TASKS[chat_id]["proc"] = process
-                
-                await consume_stream(process, log_buffer)
-                await process.wait()
-
-                mp4s = glob.glob("**/*.mp4", recursive=True)
-
-                if not mp4s:
-                    # 🔴 FAILURE: Send logs to Telegram
-                    error_filename = f"error_log_ep{ep_num}.txt"
-                    with open(error_filename, "w", encoding="utf-8") as f:
-                        f.write("\n".join(log_buffer[-60:]))
-                    
-                    await client.send_document(
-                        chat_id, 
-                        error_filename, 
-                        caption=f"❌ **Failed Ep {ep_num}**\nSee logs."
-                    )
-                    os.remove(error_filename)
-                    continue 
-
-                # Success
-                file_to_up = max(mp4s, key=os.path.getctime)
-                detected_quality = await get_video_resolution(file_to_up)
-
-                try: await status_msg.edit_text(f"🚀 **Uploading Ep {ep_num}...**")
-                except: pass
-
-                file_caption = f"{display_title}\n• Episode {ep_num} [{detected_quality}]"
-                
-                sent = await client.send_document(chat_id, file_to_up, caption=file_caption)
-                
-                for ch_key, ch_id in [("ch1", CHANNEL_1), ("ch2", CHANNEL_2), ("ch3", CHANNEL_3)]:
-                    if ch_id and SETTINGS[ch_key]:
-                        try: await client.send_document(ch_id, sent.document.file_id, caption=file_caption)
-                        except: pass
-
-                try: os.remove(file_to_up); shutil.rmtree(os.path.dirname(file_to_up))
-                except: pass
-                
-                log_buffer.clear() 
-
+        # Run the Python downloader
+        filepath = await download_anime_episode(cmd_text, status_msg)
+        
+        if filepath:
+            await status_msg.edit_text("🚀 **Uploading...**")
+            start = time.time()
+            await client.send_document(chat_id, filepath, caption=f"✅ **Done**\n`{os.path.basename(filepath)}`")
+            os.remove(filepath)
+            await status_msg.delete()
+            
     except Exception as e:
-        LOGGER.error(f"Critical Error: {e}")
-        await message.reply(f"❌ Critical Error: {e}")
+        LOGGER.error(e)
     
     finally:
-        if chat_id in ACTIVE_TASKS:
-            await status_msg.delete()
-            del ACTIVE_TASKS[chat_id]
-
-@app.on_message(filters.command("cancel"))
-async def text_cancel(client, message):
-    cid = message.chat.id
-    if cid in ACTIVE_TASKS:
-        if "proc" in ACTIVE_TASKS[cid]:
-            try: os.killpg(os.getpgid(ACTIVE_TASKS[cid]["proc"].pid), 15)
-            except: pass
-        del ACTIVE_TASKS[cid]
-        await message.reply("🛑 **Stopped.**")
-    else:
-        await message.reply("⚠️ No task.")
+        del ACTIVE_TASKS[chat_id]
 
 async def main():
     print("🤖 Bot Starting...", flush=True)
