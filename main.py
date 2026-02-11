@@ -6,11 +6,11 @@ import time
 import re
 import logging
 import sys
+import requests  # 🟢 FIXED: Was missing, causing the metadata crash
 from aiohttp import web
 from pyrogram import Client, filters, idle
 
 # --- LOGGING SETUP ---
-# Format logs to show timestamps, helpful for debugging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,7 +36,7 @@ try:
 
 except Exception as e:
     LOGGER.error(f"❌ Configuration Error: {e}")
-    # Don't exit immediately, let the logs show why
+    # Prevent immediate crash so logs can be read
     API_ID, API_HASH, BOT_TOKEN = 0, "", ""
 
 STICKER_ID = "CAACAgUAAxkBAAEQj6hpV0JDpDDOI68yH7lV879XbIWiFwACGAADQ3PJEs4sW1y9vZX3OAQ"
@@ -123,19 +123,14 @@ async def get_video_resolution(filepath):
     except: pass
     return "Unknown"
 
-# 🟢 NEW: Capture logs into a list AND print them
+# 🟢 Capture logs for Telegram reporting
 async def consume_stream(process, log_buffer):
     while True:
         line = await process.stdout.readline()
         if not line: break
         
         decoded_line = line.decode().strip()
-        
-        # 1. Print to Server Console (Render/Koyeb)
-        # using sys.stdout.flush to ensure it appears immediately
-        print(f"[SCRIPT] {decoded_line}", flush=True)
-        
-        # 2. Add to buffer for Telegram reporting
+        print(f"[SCRIPT] {decoded_line}", flush=True) # Real-time server logs
         log_buffer.append(decoded_line)
 
 # --- 5. COMMANDS ---
@@ -172,7 +167,6 @@ async def dl_cmd(client, message):
         ep_match = re.search(r'-e\s+([\d,-]+)', cmd_text)
         if not ep_match: return await message.reply("❌ Missing `-e`")
         episode_list = parse_episodes(ep_match.group(1))
-        if not episode_list: return await message.reply("❌ Invalid Episode Number")
 
         resolutions_list = ["1080", "720", "360"]
         if "-r" in cmd_text:
@@ -211,17 +205,12 @@ async def dl_cmd(client, message):
     caption_template = f"{display_title} | {anime_info['native']}\nQuality: {', '.join([f'{r}p' for r in resolutions_list])}"
 
     ACTIVE_TASKS[chat_id] = {"status": "running"}
-    
-    # 🟢 BUFFER FOR LOGS
     log_buffer = []
 
     try:
         for i, ep_num in enumerate(episode_list):
             if chat_id not in ACTIVE_TASKS: break
 
-            t_start = time.time()
-
-            # Post Cover Image (only once or per ep, logic kept from original)
             if USE_POST and i == 0:
                  for ch_key, ch_id in [("ch1", CHANNEL_1), ("ch2", CHANNEL_2), ("ch3", CHANNEL_3)]:
                     if ch_id and SETTINGS[ch_key]:
@@ -241,43 +230,40 @@ async def dl_cmd(client, message):
                 try: await status_msg.edit_text(f"📥 **Downloading Ep {ep_num}...**\nQuality: {current_res}p")
                 except: pass
 
-                # 🟢 CRITICAL: Run bash script with 2>&1 to capture stderr
-                # Added -d flag if your script supports it, otherwise relies on stderr capture
+                # Run Bash Script
                 current_cmd = f"./animepahe-dl.sh {base_args} -e {ep_num} {res_flag} {audio_flag} 2>&1"
                 
-                print(f"Running: {current_cmd}", flush=True) # Log command to server
+                print(f"Running: {current_cmd}", flush=True)
 
                 process = await asyncio.create_subprocess_shell(
                     current_cmd,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE, # Capture both streams
+                    stderr=asyncio.subprocess.PIPE,
                     preexec_fn=os.setsid
                 )
                 
                 ACTIVE_TASKS[chat_id]["proc"] = process
                 
-                # Capture output
                 await consume_stream(process, log_buffer)
                 await process.wait()
 
-                # Check for files
                 mp4s = glob.glob("**/*.mp4", recursive=True)
 
                 if not mp4s:
                     # 🔴 FAILURE: Send logs to Telegram
                     error_filename = f"error_log_ep{ep_num}.txt"
                     with open(error_filename, "w", encoding="utf-8") as f:
-                        f.write("\n".join(log_buffer[-50:])) # Last 50 lines
+                        f.write("\n".join(log_buffer[-60:]))
                     
                     await client.send_document(
                         chat_id, 
                         error_filename, 
-                        caption=f"❌ **Failed Ep {ep_num}**\nHere are the logs."
+                        caption=f"❌ **Failed Ep {ep_num}**\nSee logs."
                     )
                     os.remove(error_filename)
-                    continue # Skip to next resolution/episode
+                    continue 
 
-                # Success path
+                # Success
                 file_to_up = max(mp4s, key=os.path.getctime)
                 detected_quality = await get_video_resolution(file_to_up)
 
@@ -288,17 +274,14 @@ async def dl_cmd(client, message):
                 
                 sent = await client.send_document(chat_id, file_to_up, caption=file_caption)
                 
-                # Forwarding
                 for ch_key, ch_id in [("ch1", CHANNEL_1), ("ch2", CHANNEL_2), ("ch3", CHANNEL_3)]:
                     if ch_id and SETTINGS[ch_key]:
                         try: await client.send_document(ch_id, sent.document.file_id, caption=file_caption)
                         except: pass
 
-                # Cleanup
                 try: os.remove(file_to_up); shutil.rmtree(os.path.dirname(file_to_up))
                 except: pass
                 
-                # Clear buffer on success to save memory
                 log_buffer.clear() 
 
     except Exception as e:
