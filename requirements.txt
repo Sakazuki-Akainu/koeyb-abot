@@ -5,3 +5,4 @@ requests
 aiofiles
 dnspython
 motor
+aiohttp
