@@ -3,3 +3,4 @@ tgcrypto
 yt-dlp
 requests
 aiohttp
+curl_cffi
